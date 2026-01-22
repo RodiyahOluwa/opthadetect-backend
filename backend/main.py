@@ -1,6 +1,7 @@
 # main.py
 from typing import List, Optional
 
+
 import datetime
 import io
 import os
@@ -30,6 +31,8 @@ from torchvision import models, transforms
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pydantic import BaseModel
+from fastapi import HTTPException
 
 
 
@@ -173,6 +176,11 @@ def frontend_home():
     return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
 
 
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
 # ---------- ROUTES ----------
 
 
@@ -182,6 +190,11 @@ def login_endpoint(body: LoginRequest) -> LoginResponse:
     return LoginResponse(access_token=DEMO_TOKEN)
   raise HTTPException(status_code=401, detail="Invalid credentials")
 
+@app.post("/auth/login")
+def login(data: LoginRequest):
+    if data.email == "doctor@example.com" and data.password == "optha123":
+        return {"access_token": "opthadetect-demo-token"}
+    raise HTTPException(status_code=401, detail="Invalid credentials")
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_retinopathy_api(
