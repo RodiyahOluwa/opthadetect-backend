@@ -19,6 +19,7 @@ from fastapi import (
     Form,
     HTTPException,
     UploadFile,
+    Query,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -114,10 +115,11 @@ class ScanRecord(BaseModel):
   eye: Optional[str] = None
 
 
-def get_current_user(token: str) -> str:
-  if token != DEMO_TOKEN:
-    raise HTTPException(status_code=401, detail="Invalid token")
-  return DEMO_USER
+def get_current_user(token: str = Query(...)) -> str:
+    if token != DEMO_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return DEMO_USER
+
 
 
 # ---------- MODEL SETUP ----------
