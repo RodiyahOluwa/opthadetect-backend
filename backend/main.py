@@ -79,7 +79,8 @@ init_db()
 # ---------- AUTH (DEMO ONLY) ----------
 DEMO_USER = "doctor@example.com"
 DEMO_PASS = "optha123"
-DEMO_TOKEN = secrets.token_hex(16)
+DEMO_TOKEN = "opthadetect-demo-token"
+
 
 
 class LoginRequest(BaseModel):
@@ -177,10 +178,6 @@ def frontend_home():
 
 
 
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
 # ---------- ROUTES ----------
 
 
@@ -189,12 +186,6 @@ def login_endpoint(body: LoginRequest) -> LoginResponse:
   if body.email == DEMO_USER and body.password == DEMO_PASS:
     return LoginResponse(access_token=DEMO_TOKEN)
   raise HTTPException(status_code=401, detail="Invalid credentials")
-
-@app.post("/auth/login")
-def login(data: LoginRequest):
-    if data.email == "doctor@example.com" and data.password == "optha123":
-        return {"access_token": "opthadetect-demo-token"}
-    raise HTTPException(status_code=401, detail="Invalid credentials")
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_retinopathy_api(
