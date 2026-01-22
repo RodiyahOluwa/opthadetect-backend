@@ -6,9 +6,9 @@ pydantic
 python-multipart
 
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.1+cpu
+torch==2.6.0+cpu
 torchvision==0.21.0+cpu
 
+grad-cam==1.5.5
 
-git+https://github.com/jacobgil/pytorch-grad-cam.git
 
