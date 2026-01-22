@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pillow
+torch
+torchvision
+numpy
+pydantic
+python-multipart
+git+https://github.com/jacobgil/pytorch-grad-cam.git
+
