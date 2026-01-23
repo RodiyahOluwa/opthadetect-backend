@@ -119,7 +119,7 @@ class ScanRecord(BaseModel):
   eye: Optional[str] = None
 
 
-def get_current_user(token: str = Query(...)) -> str:
+def get_current_user(token: str = Query(None)) -> str:
     if token != DEMO_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
     return DEMO_USER
@@ -153,6 +153,11 @@ transform = transforms.Compose(
 
 # ---------- FASTAPI APP ----------
 app = FastAPI(title="OpthaDetect API")
+
+@app.options("/{path:path}")
+def options_handler(path: str):
+    return {}
+
 
 app.add_middleware(
     CORSMiddleware,
