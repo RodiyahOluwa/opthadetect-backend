@@ -1,11 +1,9 @@
 # main.py
 from typing import List, Optional
-
-
 import datetime
+import hashlib
 import io
 import os
-import secrets
 import sqlite3
 import uuid
 
@@ -31,99 +29,177 @@ from torchvision import models, transforms
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pydantic import BaseModel
-from fastapi import HTTPException
-
-
 
 # ---------- CONFIG ----------
 DATA_DIR = "data"
 IMG_DIR = os.path.join(DATA_DIR, "images")
 DB_PATH = os.path.join(DATA_DIR, "opthadetect.db")
 
+# ------------------------------------------------------------------ #
+#  ADMIN CONFIG                                                        #
+#  Set ADMIN_EMAIL to your own email. Admin can see ALL scans and     #
+#  has a dedicated /admin/scans endpoint.                             #
+# ------------------------------------------------------------------ #
+ADMIN_EMAIL = "admin@opthadetect.dev"   # ← change to your email
+ADMIN_PASS  = "admin_secret_123"        # ← change to a strong password
+
 os.makedirs(IMG_DIR, exist_ok=True)
+
 
 # ---------- DB SETUP ----------
 def get_conn() -> sqlite3.Connection:
-  conn = sqlite3.connect(DB_PATH)
-  conn.row_factory = sqlite3.Row
-  return conn
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db() -> None:
-  conn = get_conn()
-  cur = conn.cursor()
-  cur.execute(
-      """
-      CREATE TABLE IF NOT EXISTS scans (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT NOT NULL,
-          timestamp TEXT NOT NULL,
-          patient_name TEXT,
-          patient_id TEXT,
-          patient_age INTEGER,
-          eye TEXT,
-          original_path TEXT NOT NULL,
-          gradcam_path TEXT NOT NULL,
-          label TEXT NOT NULL,
-          confidence REAL NOT NULL
-      )
-      """
-  )
-  conn.commit()
-  conn.close()
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Users table
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'clinician'  -- 'clinician' | 'admin'
+        )
+        """
+    )
+
+    # Tokens table (simple token → user mapping)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tokens (
+            token   TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        """
+    )
+
+    # Scans table — now linked to user_id (integer FK) instead of freeform string
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            patient_name TEXT,
+            patient_id TEXT,
+            patient_age INTEGER,
+            eye TEXT,
+            original_path TEXT NOT NULL,
+            gradcam_path TEXT NOT NULL,
+            label TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            deleted_by_user INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        """
+    )
+
+    # Migration: add deleted_by_user column to existing databases that lack it
+    try:
+        cur.execute("ALTER TABLE scans ADD COLUMN deleted_by_user INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass  # Column already exists
+
+    # Seed the admin account
+    admin_hash = _hash_password(ADMIN_PASS)
+    cur.execute(
+        "INSERT OR IGNORE INTO users (email, password_hash, role) VALUES (?, ?, 'admin')",
+        (ADMIN_EMAIL, admin_hash),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def _hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
 
 
 init_db()
 
-# ---------- AUTH (DEMO ONLY) ----------
-DEMO_USER = "doctor@example.com"
-DEMO_PASS = "optha123"
-DEMO_TOKEN = "opthadetect-demo-token"
 
-
-
+# ---------- AUTH ----------
 class LoginRequest(BaseModel):
-  email: str
-  password: str
+    email: str
+    password: str
 
 
 class LoginResponse(BaseModel):
-  access_token: str
+    access_token: str
+    role: str
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+def _get_user_from_token(token: str) -> sqlite3.Row:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT u.id, u.email, u.role
+        FROM tokens t
+        JOIN users u ON t.user_id = u.id
+        WHERE t.token = ?
+        """,
+        (token,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_current_user(token: str = Query(None)) -> sqlite3.Row:
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    user = _get_user_from_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
+
+def require_admin(user=Depends(get_current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
 
 
 # ---------- RESPONSE MODELS ----------
 class PredictionResponse(BaseModel):
-  label: str
-  confidence: float
-  original_url: str
-  gradcam_url: str
-  timestamp: str
-  scan_id: int
-  patient_name: Optional[str] = None
-  patient_id: Optional[str] = None
-  patient_age: Optional[int] = None
-  eye: Optional[str] = None
+    label: str
+    confidence: float
+    original_url: str
+    gradcam_url: str
+    timestamp: str
+    scan_id: int
+    patient_name: Optional[str] = None
+    patient_id: Optional[str] = None
+    patient_age: Optional[int] = None
+    eye: Optional[str] = None
 
 
 class ScanRecord(BaseModel):
-  id: int
-  timestamp: str
-  label: str
-  confidence: float
-  original_url: str
-  gradcam_url: str
-  patient_name: Optional[str] = None
-  patient_id: Optional[str] = None
-  patient_age: Optional[int] = None
-  eye: Optional[str] = None
-
-
-def get_current_user(token: str = Query(None)) -> str:
-    if token != DEMO_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return DEMO_USER
-
+    id: int
+    timestamp: str
+    label: str
+    confidence: float
+    original_url: str
+    gradcam_url: str
+    patient_name: Optional[str] = None
+    patient_id: Optional[str] = None
+    patient_age: Optional[int] = None
+    eye: Optional[str] = None
+    uploaded_by: Optional[str] = None   # only visible to admin
+    deleted_by_user: Optional[bool] = None  # only visible to admin
 
 
 # ---------- MODEL SETUP ----------
@@ -154,43 +230,94 @@ transform = transforms.Compose(
 # ---------- FASTAPI APP ----------
 app = FastAPI(title="OpthaDetect API")
 
-@app.options("/{path:path}")
-def options_handler(path: str):
-    return {}
-
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.mount("/static", StaticFiles(directory=IMG_DIR), name="static")
-FRONTEND_DIR = "Static"  # contains index.html, assets/, vite.svg
+FRONTEND_DIR = "Static"
 
-# Serve React build (Vite)
-app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")), name="assets")
+app.mount(
+    "/assets",
+    StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")),
+    name="assets",
+)
+
 
 @app.get("/vite.svg", include_in_schema=False)
 def vite_svg():
     return FileResponse(os.path.join(FRONTEND_DIR, "vite.svg"))
+
 
 @app.get("/", include_in_schema=False)
 def frontend_home():
     return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
 
 
+# ---------- AUTH ROUTES ----------
 
-# ---------- ROUTES ----------
+@app.post("/auth/register", response_model=LoginResponse)
+def register(body: RegisterRequest) -> LoginResponse:
+    """Register a new clinician account."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE email = ?", (body.email,))
+    if cur.fetchone():
+        conn.close()
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    pw_hash = _hash_password(body.password)
+    cur.execute(
+        "INSERT INTO users (email, password_hash, role) VALUES (?, ?, 'clinician')",
+        (body.email, pw_hash),
+    )
+    user_id = cur.lastrowid
+
+    token = str(uuid.uuid4())
+    cur.execute("INSERT INTO tokens (token, user_id) VALUES (?, ?)", (token, user_id))
+    conn.commit()
+    conn.close()
+
+    return LoginResponse(access_token=token, role="clinician")
 
 
 @app.post("/auth/login", response_model=LoginResponse)
 def login_endpoint(body: LoginRequest) -> LoginResponse:
-  if body.email == DEMO_USER and body.password == DEMO_PASS:
-    return LoginResponse(access_token=DEMO_TOKEN)
-  raise HTTPException(status_code=401, detail="Invalid credentials")
+    conn = get_conn()
+    cur = conn.cursor()
+    pw_hash = _hash_password(body.password)
+    cur.execute(
+        "SELECT id, role FROM users WHERE email = ? AND password_hash = ?",
+        (body.email, pw_hash),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = str(uuid.uuid4())
+    cur.execute("INSERT INTO tokens (token, user_id) VALUES (?, ?)", (token, row["id"]))
+    conn.commit()
+    conn.close()
+
+    return LoginResponse(access_token=token, role=row["role"])
+
+
+@app.post("/auth/logout")
+def logout(token: str = Query(None)):
+    if token:
+        conn = get_conn()
+        conn.execute("DELETE FROM tokens WHERE token = ?", (token,))
+        conn.commit()
+        conn.close()
+    return {"detail": "Logged out"}
+
+
+# ---------- PREDICT ----------
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_retinopathy_api(
@@ -199,135 +326,230 @@ async def predict_retinopathy_api(
     patient_id: str = Form(""),
     patient_age: Optional[int] = Form(None),
     eye: str = Form(""),
-    token: str = Depends(get_current_user),
+    user=Depends(get_current_user),
 ) -> PredictionResponse:
-  # Read image
-  contents = await file.read()
-  try:
-    image = Image.open(io.BytesIO(contents)).convert("RGB")
-  except Exception:
-    raise HTTPException(status_code=400, detail="Invalid image file")
+    contents = await file.read()
+    try:
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file")
 
-  timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-  img_resized = image.resize((224, 224))
-  img_tensor = transform(img_resized).unsqueeze(0).to(device)
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    img_resized = image.resize((224, 224))
+    img_tensor = transform(img_resized).unsqueeze(0).to(device)
 
-  with torch.no_grad():
-    output = model(img_tensor)
-    probs = F.softmax(output, dim=1)
-    pred = torch.argmax(probs, dim=1).item()
-    confidence = float(probs[0][pred].item())
+    with torch.no_grad():
+        output = model(img_tensor)
+        probs = F.softmax(output, dim=1)
+        pred = torch.argmax(probs, dim=1).item()
+        confidence = float(probs[0][pred].item())
 
-  label = "DR" if pred == 0 else "NoDR"
+    label = "DR" if pred == 0 else "NoDR"
 
-  # Grad-CAM
-  rgb_img_np = np.array(img_resized).astype(np.float32) / 255.0
-  rgb_img_np = np.ascontiguousarray(rgb_img_np)
-  grayscale_cam = cam(
-      input_tensor=img_tensor, targets=[ClassifierOutputTarget(pred)]
-  )[0]
-  cam_image = show_cam_on_image(rgb_img_np, grayscale_cam, use_rgb=True)
-  cam_pil = Image.fromarray(cam_image)
+    rgb_img_np = np.array(img_resized).astype(np.float32) / 255.0
+    rgb_img_np = np.ascontiguousarray(rgb_img_np)
+    grayscale_cam = cam(
+        input_tensor=img_tensor, targets=[ClassifierOutputTarget(pred)]
+    )[0]
+    cam_image = show_cam_on_image(rgb_img_np, grayscale_cam, use_rgb=True)
+    cam_pil = Image.fromarray(cam_image)
 
-  # Save images
-  base_name = f"{timestamp}_{label}_{confidence:.2f}"
-  orig_filename = f"{base_name}_orig.png"
-  grad_filename = f"{base_name}_gradcam.png"
+    base_name = f"{timestamp}_{label}_{confidence:.2f}"
+    orig_filename = f"{base_name}_orig.png"
+    grad_filename = f"{base_name}_gradcam.png"
 
-  orig_path = os.path.join(IMG_DIR, orig_filename)
-  grad_path = os.path.join(IMG_DIR, grad_filename)
+    image.save(os.path.join(IMG_DIR, orig_filename))
+    cam_pil.save(os.path.join(IMG_DIR, grad_filename))
 
-  image.save(orig_path)
-  cam_pil.save(grad_path)
-
-  # Store record in DB
-  conn = get_conn()
-  cur = conn.cursor()
-  cur.execute(
-      """
-      INSERT INTO scans (
-          user_id, timestamp,
-          patient_name, patient_id, patient_age, eye,
-          original_path, gradcam_path,
-          label, confidence
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      """,
-      (
-          DEMO_USER,
-          timestamp,
-          patient_name or None,
-          patient_id or None,
-          patient_age,
-          eye or None,
-          orig_filename,
-          grad_filename,
-          label,
-          confidence,
-      ),
-  )
-  scan_id = cur.lastrowid
-  conn.commit()
-  conn.close()
-
-  return PredictionResponse(
-      label=label,
-      confidence=confidence,
-      original_url=f"/static/{orig_filename}",
-      gradcam_url=f"/static/{grad_filename}",
-      timestamp=timestamp,
-      scan_id=scan_id,
-      patient_name=patient_name or None,
-      patient_id=patient_id or None,
-      patient_age=patient_age,
-      eye=eye or None,
-  )
-
-
-@app.get("/records", response_model=List[ScanRecord])
-def list_records(token: str = Depends(get_current_user)) -> List[ScanRecord]:
-  conn = get_conn()
-  cur = conn.cursor()
-  cur.execute(
-      """
-      SELECT
-          id, timestamp, label, confidence,
-          original_path, gradcam_path,
-          patient_name, patient_id, patient_age, eye
-      FROM scans
-      WHERE user_id = ?
-      ORDER BY id DESC
-      """,
-      (DEMO_USER,),
-  )
-  rows = cur.fetchall()
-  conn.close()
-
-  return [
-      ScanRecord(
-          id=row["id"],
-          timestamp=row["timestamp"],
-          label=row["label"],
-          confidence=row["confidence"],
-          original_url=f"/static/{row['original_path']}",
-          gradcam_url=f"/static/{row['gradcam_path']}",
-          patient_name=row["patient_name"],
-          patient_id=row["patient_id"],
-          patient_age=row["patient_age"],
-          eye=row["eye"],
-      )
-      for row in rows
-  ]
-
-
-@app.get("/report/{scan_id}")
-def generate_report(scan_id: int, token: str = Depends(get_current_user)):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT * FROM scans WHERE id = ? AND user_id = ?",
-        (scan_id, DEMO_USER),
+        """
+        INSERT INTO scans (
+            user_id, timestamp,
+            patient_name, patient_id, patient_age, eye,
+            original_path, gradcam_path,
+            label, confidence
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user["id"],
+            timestamp,
+            patient_name or None,
+            patient_id or None,
+            patient_age,
+            eye or None,
+            orig_filename,
+            grad_filename,
+            label,
+            confidence,
+        ),
     )
+    scan_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    return PredictionResponse(
+        label=label,
+        confidence=confidence,
+        original_url=f"/static/{orig_filename}",
+        gradcam_url=f"/static/{grad_filename}",
+        timestamp=timestamp,
+        scan_id=scan_id,
+        patient_name=patient_name or None,
+        patient_id=patient_id or None,
+        patient_age=patient_age,
+        eye=eye or None,
+    )
+
+
+# ---------- RECORDS ----------
+
+@app.get("/records", response_model=List[ScanRecord])
+def list_records(user=Depends(get_current_user)) -> List[ScanRecord]:
+    """Return only the scans uploaded by the current user (clinicians).
+    Admins also see all scans via /admin/scans."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, timestamp, label, confidence,
+               original_path, gradcam_path,
+               patient_name, patient_id, patient_age, eye
+        FROM scans
+        WHERE user_id = ? AND deleted_by_user = 0
+        ORDER BY id DESC
+        """,
+        (user["id"],),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    return [
+        ScanRecord(
+            id=row["id"],
+            timestamp=row["timestamp"],
+            label=row["label"],
+            confidence=row["confidence"],
+            original_url=f"/static/{row['original_path']}",
+            gradcam_url=f"/static/{row['gradcam_path']}",
+            patient_name=row["patient_name"],
+            patient_id=row["patient_id"],
+            patient_age=row["patient_age"],
+            eye=row["eye"],
+        )
+        for row in rows
+    ]
+
+
+# ---------- DELETE SCAN (GDPR right to erasure) ----------
+
+@app.delete("/scans/{scan_id}")
+def delete_scan(scan_id: int, user=Depends(get_current_user)):
+    """
+    Clinicians: soft-delete — scan hidden from their view, but images and
+    record are retained by admin for model training (Art. 9(2)(j) UK GDPR).
+    Admins: hard-delete — permanently removes the record and all image files.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if user["role"] == "admin":
+        cur.execute("SELECT * FROM scans WHERE id = ?", (scan_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Scan not found")
+        for path_key in ("original_path", "gradcam_path"):
+            full_path = os.path.join(IMG_DIR, row[path_key])
+            if os.path.exists(full_path):
+                os.remove(full_path)
+        cur.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
+        conn.commit()
+        conn.close()
+        return {"detail": "Scan permanently deleted"}
+    else:
+        cur.execute(
+            "SELECT * FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, user["id"]),
+        )
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Scan not found")
+        cur.execute("UPDATE scans SET deleted_by_user = 1 WHERE id = ?", (scan_id,))
+        conn.commit()
+        conn.close()
+        return {"detail": "Scan removed from your records"}
+
+
+# ---------- ADMIN ROUTES ----------
+
+@app.get("/admin/scans", response_model=List[ScanRecord])
+def admin_list_all_scans(admin=Depends(require_admin)) -> List[ScanRecord]:
+    """Admin-only: view every scan uploaded by every user."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT s.id, s.timestamp, s.label, s.confidence,
+               s.original_path, s.gradcam_path,
+               s.patient_name, s.patient_id, s.patient_age, s.eye,
+               s.deleted_by_user,
+               u.email AS uploaded_by
+        FROM scans s
+        JOIN users u ON s.user_id = u.id
+        ORDER BY s.id DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    return [
+        ScanRecord(
+            id=row["id"],
+            timestamp=row["timestamp"],
+            label=row["label"],
+            confidence=row["confidence"],
+            original_url=f"/static/{row['original_path']}",
+            gradcam_url=f"/static/{row['gradcam_path']}",
+            patient_name=row["patient_name"],
+            patient_id=row["patient_id"],
+            patient_age=row["patient_age"],
+            eye=row["eye"],
+            uploaded_by=row["uploaded_by"],
+        )
+        for row in rows
+    ]
+
+
+@app.get("/admin/users")
+def admin_list_users(admin=Depends(require_admin)):
+    """Admin-only: list all registered users."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, email, role FROM users ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    return [{"id": r["id"], "email": r["email"], "role": r["role"]} for r in rows]
+
+
+# ---------- REPORT ----------
+
+@app.get("/report/{scan_id}")
+def generate_report(scan_id: int, user=Depends(get_current_user)):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if user["role"] == "admin":
+        cur.execute("SELECT * FROM scans WHERE id = ?", (scan_id,))
+    else:
+        cur.execute(
+            "SELECT * FROM scans WHERE id = ? AND user_id = ?",
+            (scan_id, user["id"]),
+        )
+
     row = cur.fetchone()
     conn.close()
 
@@ -340,11 +562,9 @@ def generate_report(scan_id: int, token: str = Depends(get_current_user)):
     if not os.path.exists(orig_path) or not os.path.exists(grad_path):
         raise HTTPException(status_code=404, detail="Images not found")
 
-    # Load images
     orig = Image.open(orig_path).convert("RGB")
     grad = Image.open(grad_path).convert("RGB")
 
-    # Resize for layout
     target_height = 550
     margin = 50
     gap = 40
@@ -357,14 +577,12 @@ def generate_report(scan_id: int, token: str = Depends(get_current_user)):
     orig_r = resize_img(orig)
     grad_r = resize_img(grad)
 
-    # Canvas size (a bit taller so there is room for footer)
     canvas_width = orig_r.width + grad_r.width + gap + margin * 2
-    canvas_height = target_height + 480  # was 350 – now taller for footer
+    canvas_height = target_height + 480
 
     report = Image.new("RGB", (canvas_width, canvas_height), "white")
     draw = ImageDraw.Draw(report)
 
-    # Load nicer fonts
     try:
         font_title = ImageFont.truetype("arial.ttf", 42)
         font_sub = ImageFont.truetype("arial.ttf", 28)
@@ -377,73 +595,25 @@ def generate_report(scan_id: int, token: str = Depends(get_current_user)):
         font_small = ImageFont.load_default()
 
     y = margin
-
-    # Title
-    draw.text(
-        (margin, y),
-        "OpthaDetect · Diabetic Retinopathy Report",
-        fill="black",
-        font=font_title,
-    )
+    draw.text((margin, y), "OpthaDetect · Diabetic Retinopathy Report", fill="black", font=font_title)
     y += 60
-
-    # Patient details
-    draw.text(
-        (margin, y),
-        f"Patient: {row['patient_name'] or '-'}   ID: {row['patient_id'] or '-'}",
-        fill="black",
-        font=font_sub,
-    )
+    draw.text((margin, y), f"Patient: {row['patient_name'] or '-'}   ID: {row['patient_id'] or '-'}", fill="black", font=font_sub)
     y += 35
-
-    draw.text(
-        (margin, y),
-        f"Age: {row['patient_age'] or '-'}   Eye: {row['eye'] or '-'}",
-        fill="black",
-        font=font_sub,
-    )
+    draw.text((margin, y), f"Age: {row['patient_age'] or '-'}   Eye: {row['eye'] or '-'}", fill="black", font=font_sub)
     y += 35
-
-    draw.text(
-        (margin, y),
-        f"Timestamp: {row['timestamp']}",
-        fill="black",
-        font=font_sub,
-    )
+    draw.text((margin, y), f"Timestamp: {row['timestamp']}", fill="black", font=font_sub)
     y += 50
 
-    # Insert images
     report.paste(orig_r, (margin, y))
     report.paste(grad_r, (margin + orig_r.width + gap, y))
     y += target_height + 40
 
-    # Prediction details
-    draw.text(
-        (margin, y),
-        f"Result: {row['label']}",
-        fill="black",
-        font=font_sub,
-    )
+    draw.text((margin, y), f"Result: {row['label']}", fill="black", font=font_sub)
     y += 35
+    draw.text((margin, y), f"Confidence: {row['confidence']:.2f}", fill="black", font=font_sub)
+    y += 40
+    draw.text((margin, y), "Prototype tool. Not approved for independent clinical use.", fill="gray", font=font_small)
 
-    draw.text(
-        (margin, y),
-        f"Confidence: {row['confidence']:.2f}",
-        fill="black",
-        font=font_sub,
-    )
-    y += 40  # extra gap before disclaimer
-
-    # Disclaimer – now clearly below the results section
-    disclaimer = "Prototype tool. Not approved for independent clinical use."
-    draw.text(
-        (margin, y),
-        disclaimer,
-        fill="gray",
-        font=font_small,
-    )
-
-    # Save the PDF
     pdf_name = f"report_{scan_id}.pdf"
     pdf_path = os.path.join(DATA_DIR, pdf_name)
     report.save(pdf_path, "PDF", resolution=300)
@@ -454,13 +624,6 @@ def generate_report(scan_id: int, token: str = Depends(get_current_user)):
         filename=f"OpthaDetect_Report_{scan_id}.pdf",
     )
 
-#@app.get("/{path:path}", include_in_schema=False)
-#def frontend_fallback(path: str):
-    # Let API and files behave normally
-    if path.startswith(("auth", "predict", "records", "report", "docs", "openapi.json", "static", "assets", "vite.svg")):
-        raise HTTPException(status_code=404, detail="Not Found")
-    return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
-
 
 if __name__ == "__main__":
-  uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
