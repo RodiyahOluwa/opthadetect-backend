@@ -40,8 +40,8 @@ DB_PATH = os.path.join(DATA_DIR, "opthadetect.db")
 #  Set ADMIN_EMAIL to your own email. Admin can see ALL scans and     #
 #  has a dedicated /admin/scans endpoint.                             #
 # ------------------------------------------------------------------ #
-ADMIN_EMAIL = "admin@opthadetect.dev"   # ← change to your email
-ADMIN_PASS  = "admin_secret_123"        # ← change to a strong password
+ADMIN_EMAIL = "admin@opthadetect.com"   # ← change to your email
+ADMIN_PASS  = "NewSecurePassword123"        # ← change to a strong password
 
 os.makedirs(IMG_DIR, exist_ok=True)
 
@@ -80,6 +80,19 @@ def init_db() -> None:
         """
     )
 
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS password_resets (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        """
+    )
+
     # Scans table — now linked to user_id (integer FK) instead of freeform string
     cur.execute(
         """
@@ -110,7 +123,13 @@ def init_db() -> None:
     # Seed the admin account
     admin_hash = _hash_password(ADMIN_PASS)
     cur.execute(
-        "INSERT OR IGNORE INTO users (email, password_hash, role) VALUES (?, ?, 'admin')",
+        """
+        INSERT INTO users (email, password_hash, role)
+        VALUES (?, ?, 'admin')
+        ON CONFLICT(email) DO UPDATE SET
+            password_hash = excluded.password_hash,
+            role = 'admin'
+        """,
         (ADMIN_EMAIL, admin_hash),
     )
 
@@ -139,6 +158,14 @@ class LoginResponse(BaseModel):
 class RegisterRequest(BaseModel):
     email: str
     password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
 
 
 def _get_user_from_token(token: str) -> sqlite3.Row:
@@ -306,6 +333,69 @@ def login_endpoint(body: LoginRequest) -> LoginResponse:
 
     return LoginResponse(access_token=token, role=row["role"])
 
+
+@app.post("/auth/forgot-password")
+def forgot_password(body: ForgotPasswordRequest):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE email = ?", (body.email,))
+    row = cur.fetchone()
+
+    if row:
+        token = str(uuid.uuid4())
+        expires_at = (datetime.datetime.utcnow() + datetime.timedelta(hours=1)).isoformat()
+        cur.execute(
+            "INSERT INTO password_resets (token, user_id, expires_at, used) VALUES (?, ?, ?, 0)",
+            (token, row["id"], expires_at),
+        )
+        conn.commit()
+
+        # later: send email here
+        print(f"RESET LINK: https://opthadetect.com/reset-password?token={token}")
+
+    conn.close()
+    return {"detail": "If that email exists, we’ve sent a reset link."}
+
+@app.post("/auth/reset-password")
+def reset_password(body: ResetPasswordRequest):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, expires_at, used
+        FROM password_resets
+        WHERE token = ?
+        """,
+        (body.token,),
+    )
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    if row["used"] == 1:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    expires_at = datetime.datetime.fromisoformat(row["expires_at"])
+    if datetime.datetime.utcnow() > expires_at:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    new_hash = _hash_password(body.new_password)
+    cur.execute(
+        "UPDATE users SET password_hash = ? WHERE id = ?",
+        (new_hash, row["user_id"]),
+    )
+    cur.execute(
+        "UPDATE password_resets SET used = 1 WHERE token = ?",
+        (body.token,),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"detail": "Password reset successful"}
 
 @app.post("/auth/logout")
 def logout(token: str = Query(None)):
@@ -519,6 +609,7 @@ def admin_list_all_scans(admin=Depends(require_admin)) -> List[ScanRecord]:
             patient_age=row["patient_age"],
             eye=row["eye"],
             uploaded_by=row["uploaded_by"],
+            deleted_by_user=row["deleted_by_user"] == 1
         )
         for row in rows
     ]
